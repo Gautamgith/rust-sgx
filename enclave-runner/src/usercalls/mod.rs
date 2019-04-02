@@ -163,18 +163,18 @@ pub trait SyncStream: 'static + Send + Sync {
 }
 
 
-trait SyncListener: 'static + Send + Sync {
-    fn accept(&self) -> IoResult<(FileDesc, Box<ToString>, Box<ToString>)>;
+pub trait SyncListener: 'static + Send + Sync {
+    fn accept(&self) -> IoResult<(Box<SyncStream>, Box<ToString>, Box<ToString>)>;
 }
 
 impl SyncListener for TcpListener {
-    fn accept(&self) -> IoResult<(FileDesc, Box<ToString>, Box<ToString>)> {
+    fn accept(&self) -> IoResult<(Box<SyncStream>, Box<ToString>, Box<ToString>)> {
         TcpListener::accept(self).map(|(s, peer)| {
             let local = match s.local_addr() {
                 Ok(local) => Box::new(local) as _,
                 Err(_) => Box::new("error") as _,
             };
-            (FileDesc::stream(s), local, Box::new(peer) as _)
+            (Box::new(s) as _, local, Box::new(peer) as _)
         })
     }
 }
@@ -579,6 +579,21 @@ pub trait UsercallExtension : 'static + Send + Sync + std::fmt::Debug {
     ) -> IoResult<Option<Box<SyncStream>>> {
         Ok(None)
     }
+
+    /// Override the target for bind calls by the enclave. The runner should determine the service that the enclave is trying to bind to by looking at addr.
+    /// If `bind_stream` returns None, the default implementation of [`bind_stream`](../../fortanix_sgx_abi/struct.Usercalls.html#method.bind_stream) is used.
+    /// The enclave may optionally request the local be returned in `local_addr`.
+    /// On success, if `local_addr` is not None, user-space can fill in the string as appropriate.
+    ///
+    /// The enclave must not make any security decisions based on the local address received.
+    #[allow(unused)]
+    fn bind_stream(&self,
+                  addr: &str,
+                  local_addr: Option<&mut String>
+                  ) -> IoResult<Option<Box<SyncListener>>> {
+        Ok(None)
+    }
+
 }
 
 impl<T: UsercallExtension> From<T> for Box<UsercallExtension> {
@@ -596,6 +611,13 @@ impl UsercallExtension for UsercallExtensionDefault{
         _local_addr: Option<&mut String>,
         _peer_addr: Option<&mut String>,
     ) -> IoResult<Option<Box<SyncStream>>> {
+        Ok(None)
+    }
+
+    fn bind_stream(&self,
+                  _addr: &str,
+                  _local_addr: Option<&mut String>
+                  ) -> IoResult<Option<Box<SyncListener>>> {
         Ok(None)
     }
 }
@@ -707,6 +729,14 @@ impl RunningTcs {
     #[inline(always)]
     fn bind_stream(&self, addr: &[u8], local_addr: Option<&mut OutputBuffer>) -> IoResult<Fd> {
         let addr = str::from_utf8(addr).map_err(|_| IoErrorKind::ConnectionRefused)?;
+        let mut local_addr_str = local_addr.as_ref().map(|_| String::new());
+        if let Some(stream_ext) = self.enclave.usercall_ext
+            .bind_stream(&addr, local_addr_str.as_mut())? {
+            if let Some(local_addr) = local_addr {
+                local_addr.set(local_addr_str.unwrap().into_bytes());
+            }
+            return Ok(self.alloc_fd(FileDesc::Listener(stream_ext)));
+        }
         let socket = TcpListener::bind(addr)?;
         if let Some(local_addr) = local_addr {
             local_addr.set(socket.local_addr()?.to_string().into_bytes())
@@ -728,7 +758,7 @@ impl RunningTcs {
         if let Some(peer_addr) = peer_addr {
             peer_addr.set(peer.to_string().into_bytes())
         }
-        Ok(self.alloc_fd(stream))
+        Ok(self.alloc_fd(FileDesc::Stream(stream)))
     }
 
     #[inline(always)]
